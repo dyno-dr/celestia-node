@@ -79,6 +79,19 @@ func fullDiscoveryAndPeerManager(tp node.Type, cfg *Config) fx.Option {
 				discOpts = append(discOpts, discovery.WithAdvertise())
 			}
 
+			// Apply diversity peer filter if configured.
+			// DiversityBucketBits > 0 enables eclipse-resistance: at most
+			// DiversityMaxPerBucket peers from the same ID-prefix bucket
+			// are allowed into the discovery set simultaneously.
+			if cfg.Discovery.DiversityBucketBits > 0 {
+				discOpts = append(discOpts, discovery.WithPeerFilter(
+					discovery.DiversityFilter(
+						cfg.Discovery.DiversityBucketBits,
+						cfg.Discovery.DiversityMaxPerBucket,
+					),
+				))
+			}
+
 			fullDisc, err := discovery.NewDiscovery(
 				cfg.Discovery,
 				host,

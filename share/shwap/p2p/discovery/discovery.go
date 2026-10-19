@@ -57,6 +57,8 @@ type Discovery struct {
 	// indicates whether the discovery instance should also advertise
 	// to the topic
 	advertise bool
+	// peerFilter, if set, gates every peer before it enters the set.
+	peerFilter PeerFilter
 
 	triggerDisc chan struct{}
 
@@ -105,6 +107,7 @@ func NewDiscovery(
 		connector:      newBackoffConnector(h, defaultBackoffFactory),
 		onUpdatedPeers: o.onUpdatedPeers,
 		advertise:      o.advertise,
+		peerFilter:     o.peerFilter,
 		params:         params,
 		triggerDisc:    make(chan struct{}),
 	}, nil
@@ -375,6 +378,12 @@ func (d *Discovery) handleDiscoveredPeer(ctx context.Context, peer peer.AddrInfo
 		return false
 	}
 
+	// Apply diversity filter if configured.
+	if d.peerFilter != nil && !d.peerFilter(peer.ID) {
+		d.metrics.observeHandlePeer(ctx, handlePeerEnoughPeers)
+		logger.Debug("skip handle: rejected by peer filter (diversity)")
+		return false
+	}
 	if !d.set.Add(peer.ID) {
 		d.metrics.observeHandlePeer(ctx, handlePeerInSet)
 		logger.Debug("peer is already in discovery set")

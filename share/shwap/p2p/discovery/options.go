@@ -17,6 +17,14 @@ type Parameters struct {
 	// AdvertiseInterval is a interval between advertising sessions.
 	// NOTE: only full and bridge can advertise themselves.
 	AdvertiseInterval time.Duration
+	// DiversityBucketBits controls the peer-ID prefix bucketing for
+	// eclipse-resistance. Peers are bucketed by the top DiversityBucketBits
+	// bits of SHA-256(peerID). Set to 0 to disable diversity filtering.
+	DiversityBucketBits uint
+	// DiversityMaxPerBucket is the maximum number of peers allowed from the
+	// same ID-prefix bucket in the discovery set. Only used when
+	// DiversityBucketBits > 0.
+	DiversityMaxPerBucket int
 }
 
 // options is the set of options that can be configured for the Discovery module
@@ -26,6 +34,9 @@ type options struct {
 	// advertise indicates whether the node should also
 	// advertise to the discovery instance's topic
 	advertise bool
+	// peerFilter, if non-nil, is called before adding a peer to the set.
+	// Returning false rejects the peer (e.g. for diversity enforcement).
+	peerFilter PeerFilter
 }
 
 // Option is a function that configures Discovery Parameters
@@ -65,10 +76,20 @@ func WithAdvertise() Option {
 	}
 }
 
+// WithPeerFilter sets a filter called before each discovered peer is added
+// to the set. Return false to reject the peer. Use DiversityFilter() to
+// create a bucket-based filter that limits Sybil eclipse attacks.
+func WithPeerFilter(f PeerFilter) Option {
+	return func(p *options) {
+		p.peerFilter = f
+	}
+}
+
 func newOptions(opts ...Option) *options {
 	defaults := &options{
 		onUpdatedPeers: func(peer.ID, bool) {},
 		advertise:      false,
+		peerFilter:     nil,
 	}
 
 	for _, opt := range opts {
