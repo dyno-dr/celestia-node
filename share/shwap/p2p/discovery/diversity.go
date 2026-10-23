@@ -13,23 +13,26 @@ import (
 // It is called inside handleDiscoveredPeer, before d.set.Add().
 type PeerFilter func(p peer.ID) bool
 
+// PeerGater is implemented by any type that can block a peer at the
+// connection level (e.g. *conngater.BasicConnectionGater).
+// Using an interface keeps the discovery package free of a hard conngater dep.
+type PeerGater interface {
+	BlockPeer(p peer.ID) error
+}
+
 // DiversityFilter returns a PeerFilter that limits how many peers from the
 // same ID-prefix bucket can enter the discovery set simultaneously.
 //
 // Algorithm:
 //  1. Hash the peer ID with SHA-256.
 //  2. Take the top `bucketBits` bits of the hash as the bucket number.
-//  3. Count how many current set members belong to each bucket.
-//  4. Reject the peer if its bucket already has >= maxPerBucket members.
+//  3. Count current set members per bucket.
+//  4. Reject if bucket >= maxPerBucket.
 //
 // Defense rationale:
-//  An attacker generating many peer IDs at random will spread across buckets
-//  naturally. With bucketBits=8 (256 buckets) and maxPerBucket=2, the attacker
-//  can place at most 2 peers per bucket. To fill a PeersLimit=4 set, the
-//  attacker needs keys in at least 2 different buckets -- which is still
-//  possible but limits the eclipse rate. A targeted key-grinding attack
-//  (generating keys all in the same bucket) is computationally expensive and
-//  detectable.
+//  An attacker generating random peer IDs spreads across buckets naturally.
+//  With bucketBits=2 (4 buckets) and maxPerBucket=1, the filter allows at
+//  most 4 Sybil peers into the discovery set regardless of fleet size.
 func DiversityFilter(bucketBits uint, maxPerBucket int) PeerFilter {
 	var mu sync.Mutex
 	buckets := make(map[uint64]int)
@@ -40,7 +43,6 @@ func DiversityFilter(bucketBits uint, maxPerBucket int) PeerFilter {
 		if bucketBits >= 64 {
 			return raw
 		}
-		// keep only the top bucketBits bits
 		return raw >> (64 - bucketBits)
 	}
 
@@ -53,5 +55,29 @@ func DiversityFilter(bucketBits uint, maxPerBucket int) PeerFilter {
 		}
 		buckets[bucket]++
 		return true
+	}
+}
+
+// DiversityFilterWithGater is like DiversityFilter but additionally blocks
+// rejected peers at the connection layer via gater.BlockPeer().
+// This prevents Sybil nodes from establishing incoming connections to the
+// local node even if they were not discovered via the active discovery loop.
+//
+// This completes the two-layer eclipse defense:
+//   Layer 1 (DiversityFilter):         limits peers in the discovery set
+//   Layer 2 (DiversityFilterWithGater): also blocks incoming Sybil connections
+func DiversityFilterWithGater(bucketBits uint, maxPerBucket int, gater PeerGater) PeerFilter {
+	inner := DiversityFilter(bucketBits, maxPerBucket)
+
+	return func(p peer.ID) bool {
+		if inner(p) {
+			return true
+		}
+		// Peer was rejected by the diversity filter.
+		// Block it at the connection layer so it cannot connect from its side.
+		if gater != nil {
+			_ = gater.BlockPeer(p) // best-effort; log errors in the caller
+		}
+		return false
 	}
 }

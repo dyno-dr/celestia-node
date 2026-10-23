@@ -33,7 +33,6 @@ const (
 
 // TestEclipseBaseline measures the light node peer set with only honest nodes.
 func TestEclipseBaseline(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), swamp.DefaultTestTimeout)
 	t.Cleanup(cancel)
 
@@ -96,7 +95,6 @@ func TestEclipseBaseline(t *testing.T) {
 
 // TestEclipseAttack: Sybil nodes flood discovery, crowding out honest peers.
 func TestEclipseAttack(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), swamp.DefaultTestTimeout)
 	t.Cleanup(cancel)
 
@@ -223,7 +221,6 @@ const (
 // peers in the discovery-managed peer pool, giving the honest bridge more
 // opportunities to respond — raising the DAS success rate.
 func TestEclipseDefended(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), swamp.DefaultTestTimeout)
 	t.Cleanup(cancel)
 
@@ -349,4 +346,158 @@ func TestEclipseDefended(t *testing.T) {
 	// for at least some heights even under attack.
 	require.Greater(t, successCount, 0,
 		"expected at least some DAS successes with honest bridge in discovery set")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5: Full Two-Layer Eclipse Defense
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Layer 1 (Phase 4): DiversityFilter — limits Sybil peers in the discovery set
+// Layer 2 (Phase 5): DiversityFilterWithGater — blocks rejected peers at the
+//   connection layer so Sybil nodes cannot connect from their side either.
+//
+// With both layers active, P2P.Peers() should reflect the diversity-filtered
+// peer set (not inflated by incoming Sybil connections).
+
+// TestEclipseFullDefense runs the 30-Sybil flood with the full two-layer
+// defense enabled via config. It measures:
+//   1. P2P.Peers() — should now be dominated by honest peers (Layer 2 effect)
+//   2. DAS success rate — should be 100% (Layer 1 effect)
+func TestEclipseFullDefense(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), swamp.DefaultTestTimeout)
+	t.Cleanup(cancel)
+
+	sw := swamp.NewSwamp(t, swamp.WithBlockTime(eclipseBlockTime))
+
+	// Honest bridge
+	bridge := sw.NewBridgeNode()
+	require.NoError(t, bridge.Start(ctx))
+	sw.SetBootstrapper(t, bridge)
+
+	bridgeClient := getAdminClient(ctx, bridge, t)
+	bridgeInfo, err := bridgeClient.P2P.Info(ctx)
+	require.NoError(t, err)
+	honestIDs := map[peer.ID]string{bridgeInfo.ID: "bridge"}
+
+	// 30 Sybil nodes
+	sybilIDs := make(map[peer.ID]bool)
+	var mu sync.Mutex
+	resetHandler := func(stream network.Stream) { _ = stream.Reset() }
+
+	t.Logf("Starting %d Sybil nodes...", eclipseSybilCountLarge)
+	for i := 0; i < eclipseSybilCountLarge; i++ {
+		cfg := sw.DefaultTestConfig(node.Bridge)
+		setTimeInterval(cfg, eclipseDiscovery)
+		sybil := sw.NewNodeWithConfig(node.Bridge, cfg,
+			replaceShrexServer(cfg, resetHandler),
+			replaceShareGetter(),
+		)
+		require.NoError(t, sybil.Start(ctx))
+		sc := getAdminClient(ctx, sybil, t)
+		info, err := sc.P2P.Info(ctx)
+		require.NoError(t, err)
+		mu.Lock()
+		sybilIDs[info.ID] = true
+		mu.Unlock()
+	}
+
+	// Light node with FULL defense: DiversityBucketBits=2, MaxPerBucket=1
+	// The DiversityFilterWithGater is automatically used in p2p_constructors.go
+	// when DiversityBucketBits > 0 — it both limits the discovery set AND
+	// calls connGater.BlockPeer() for every rejected peer.
+	lnCfg := sw.DefaultTestConfig(node.Light)
+	lnCfg.Share.Discovery.PeersLimit = eclipsePeerLimit
+	lnCfg.Share.Discovery.DiversityBucketBits = eclipseBucketBits
+	lnCfg.Share.Discovery.DiversityMaxPerBucket = eclipseMaxPerBucket
+	setTimeInterval(lnCfg, eclipseDiscovery)
+
+	light := sw.NewNodeWithConfig(node.Light, lnCfg)
+	require.NoError(t, light.Start(ctx))
+	lightClient := getAdminClient(ctx, light, t)
+
+	t.Logf("Waiting %s for defenses to take effect...", eclipseWaitAttack)
+	select {
+	case <-time.After(eclipseWaitAttack):
+	case <-ctx.Done():
+		t.Fatal("context cancelled")
+	}
+
+	// ── Metric 1: raw P2P connection count ───────────────────────────────────
+	peers, err := lightClient.P2P.Peers(ctx)
+	require.NoError(t, err)
+
+	sybilConnected, honestConnected := 0, 0
+	for _, pid := range peers {
+		if sybilIDs[pid] {
+			sybilConnected++
+		} else if honestIDs[pid] != "" {
+			honestConnected++
+		}
+	}
+
+	p2pEclipseRate := 0.0
+	if len(peers) > 0 {
+		p2pEclipseRate = float64(sybilConnected) / float64(len(peers)) * 100
+	}
+
+	// ── Metric 2: DAS sampling success rate ──────────────────────────────────
+	headHdr, err := lightClient.Header.NetworkHead(ctx)
+	require.NoError(t, err)
+	head := headHdr.Height()
+
+	startHeight := uint64(1)
+	if head > uint64(eclipseDASTrials) {
+		startHeight = head - uint64(eclipseDASTrials) + 1
+	}
+
+	dasSuccess := 0
+	dasTrials := int(head-startHeight) + 1
+	for h := startHeight; h <= head; h++ {
+		sampleCtx, sampleCancel := context.WithTimeout(ctx, eclipseDASTimeout)
+		err := lightClient.Share.SharesAvailable(sampleCtx, h)
+		sampleCancel()
+		if err == nil {
+			dasSuccess++
+			t.Logf("  height=%d  DAS=SUCCESS", h)
+		} else {
+			t.Logf("  height=%d  DAS=FAIL  err=%v", h, err)
+		}
+	}
+
+	dasSuccessRate := 0.0
+	if dasTrials > 0 {
+		dasSuccessRate = float64(dasSuccess) / float64(dasTrials) * 100
+	}
+
+	t.Logf("=== PHASE 5 FULL TWO-LAYER DEFENSE ===")
+	t.Logf("Layer 1: DiversityFilter (bucketBits=%d, maxPerBucket=%d)",
+		eclipseBucketBits, eclipseMaxPerBucket)
+	t.Logf("Layer 2: DiversityFilterWithGater (blocks rejected peers via connGater)")
+	t.Logf("Sybil fleet: %d nodes | Honest: 1 bridge | PeersLimit=%d",
+		eclipseSybilCountLarge, eclipsePeerLimit)
+	t.Logf("P2P connections: sybil=%d honest=%d total=%d (eclipse_rate=%.0f%%)",
+		sybilConnected, honestConnected, len(peers), p2pEclipseRate)
+	t.Logf("DAS sampling: %d/%d heights succeeded (%.0f%% success rate)",
+		dasSuccess, dasTrials, dasSuccessRate)
+	t.Logf("RESULT phase=full_defense p2p_eclipse_rate=%.0f das_success_rate=%.0f sybil_fleet=%d",
+		p2pEclipseRate, dasSuccessRate, eclipseSybilCountLarge)
+
+	// DAS must succeed with full defense
+	require.Greater(t, dasSuccess, 0,
+		"DAS should succeed: honest bridge is always in the diversity-filtered discovery set")
+}
+
+// TestEclipseSuite runs all eclipse-attack experiments sequentially.
+// Running them in parallel would spin up 76+ nodes simultaneously
+// (4 blockchains × (1 bridge + 30 Sybil + 1 light)) causing resource
+// exhaustion in the in-process mocknet. Sequential execution ensures
+// each experiment gets the full resources it needs.
+func TestEclipseSuite(t *testing.T) {
+	// TestEclipseFullDefense is intentionally excluded from this suite.
+	// It requires 31 nodes (30 Sybil + 1 bridge + 1 light) and suffers from
+	// a CometBFT/Pebble DB teardown race when all nodes shut down sequentially
+	// inside the same test process. Run it standalone: -run TestEclipseFullDefense.
+	t.Run("Baseline", TestEclipseBaseline)
+	t.Run("Attack", TestEclipseAttack)
+	t.Run("Defended", TestEclipseDefended)
 }

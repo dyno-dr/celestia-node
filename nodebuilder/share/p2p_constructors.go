@@ -83,11 +83,14 @@ func fullDiscoveryAndPeerManager(tp node.Type, cfg *Config) fx.Option {
 			// DiversityBucketBits > 0 enables eclipse-resistance: at most
 			// DiversityMaxPerBucket peers from the same ID-prefix bucket
 			// are allowed into the discovery set simultaneously.
+			// DiversityFilterWithGater additionally blocks rejected peers at
+			// the connection layer (Layer 2 defense against incoming Sybil).
 			if cfg.Discovery.DiversityBucketBits > 0 {
 				discOpts = append(discOpts, discovery.WithPeerFilter(
-					discovery.DiversityFilter(
+					discovery.DiversityFilterWithGater(
 						cfg.Discovery.DiversityBucketBits,
 						cfg.Discovery.DiversityMaxPerBucket,
+						connGater,
 					),
 				))
 			}
