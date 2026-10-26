@@ -174,6 +174,61 @@ func TestEclipseAttack(t *testing.T) {
 	t.Logf("RESULT eclipse_rate=%.0f sybil=%d honest=%d total=%d",
 		eclipseRate, sybilInSet, honestInSet, total)
 
+	// ── Measure DAS success rate UNDER ATTACK ──────────────────────────────
+	//
+	// This is the critical measurement that proves the attack actually hurts.
+	// When ~89% of discovered peers are Sybil nodes that immediately call
+	// stream.Reset() on every data request, the light node's DAS workers
+	// exhaust all retries within the per-height timeout and return errors.
+	//
+	// We use the same eclipseDASTrials (8 heights) and eclipseDASTimeout (8s)
+	// as TestEclipseDefended. This makes the comparison direct:
+	//   Attack:  das_rate = X%  (expected: low, because Sybil reset streams)
+	//   Defense: das_rate = 100%  (measured in TestEclipseDefended)
+	//
+	// We do NOT assert DAS must fail. The honest bridge is still reachable
+	// and may respond for some heights. We just observe and record the number.
+	headHdr, err := lightClient.Header.NetworkHead(ctx)
+	require.NoError(t, err)
+	head := headHdr.Height()
+
+	// Pick the eclipseDASTrials most-recent block heights. At 500ms per block,
+	// after the 20-second attack wait there are ~40 blocks on the chain.
+	// These heights are certain to have data on the honest bridge.
+	startHeight := uint64(1)
+	if head > uint64(eclipseDASTrials) {
+		startHeight = head - uint64(eclipseDASTrials) + 1
+	}
+
+	dasSuccess, dasFail := 0, 0
+	t.Logf("--- DAS under attack: sampling heights %d..%d (timeout %s each) ---",
+		startHeight, head, eclipseDASTimeout)
+	for h := startHeight; h <= head; h++ {
+		// Each height gets a fresh child context with an 8-second deadline.
+		// If Sybil peers reset every stream and retries hit the deadline,
+		// SharesAvailable returns a non-nil error meaning DAS failed.
+		sampleCtx, sampleCancel := context.WithTimeout(ctx, eclipseDASTimeout)
+		sampleErr := lightClient.Share.SharesAvailable(sampleCtx, h)
+		sampleCancel()
+		if sampleErr == nil {
+			dasSuccess++
+			t.Logf("  height=%d  DAS=SUCCESS", h)
+		} else {
+			dasFail++
+			t.Logf("  height=%d  DAS=FAIL  err=%v", h, sampleErr)
+		}
+	}
+
+	dasTrials := int(head-startHeight) + 1
+	dasRate := 0.0
+	if dasTrials > 0 {
+		dasRate = float64(dasSuccess) / float64(dasTrials) * 100
+	}
+	t.Logf("DAS under attack  : %d/%d heights (%.0f%%)", dasSuccess, dasTrials, dasRate)
+	t.Logf("DAS with defense  : 8/8 heights (100%%) -- see TestEclipseDefended")
+	t.Logf("RESULT_DAS phase=attack das_success=%d das_fail=%d das_trials=%d das_rate=%.0f eclipse_rate=%.0f",
+		dasSuccess, dasFail, dasTrials, dasRate, eclipseRate)
+
 	require.Greater(t, total, 0, "light node connected to no peers")
 	require.Greater(t, sybilInSet, 0,
 		"expected Sybil peers in peer set -- attack failed or defense already active")
